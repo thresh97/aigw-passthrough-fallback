@@ -1,0 +1,5 @@
+CLAUDE.local.md
+.env
+gateway-key.json
+*.secret
+*.local.json
