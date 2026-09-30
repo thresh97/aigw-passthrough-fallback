@@ -53,7 +53,8 @@ The model IDs above are the Vertex ones used in testing. Check yours by calling 
 
 ## 1. Build (airs-cli)
 
-The routing config (the production-like one; the forced test config differs only in `request_timeout: 1`):
+One routing config. Its Anthropic timeout is set inside the "auth window" (see below), so on a healthy Anthropic every good
+request fails over while a bad token still gets Anthropic's 401:
 
 ```json
 {
@@ -65,7 +66,7 @@ The routing config (the production-like one; the forced test config differs only
     {
       "provider": "anthropic",
       "forward_headers": ["authorization", "anthropic-beta"],
-      "request_timeout": 120000
+      "request_timeout": 250
     },
     {
       "strategy": {
@@ -93,8 +94,13 @@ The routing config (the production-like one; the forced test config differs only
 - The fallback is a nested conditional router on the requested model name, so each Claude Code tier keeps its tier.
   `override_params.model` swaps in the fallback provider's model ID. The fallback targets forward no client headers; they use
   the provider's own credentials.
+- `request_timeout: 250` (ms) is the demo value. Through the test gateway, Anthropic rejected a bad token within ~200 ms but
+  took longer than ~350 ms to start a good streamed response. A timeout in between gives a clean demo: good requests always
+  time out (408) and go to the fallback, bad tokens always get the 401 and never reach it. The window depends on where your
+  gateway runs, so measure it (see [Findings](#findings)). **For real use, set a generous timeout** (e.g. `120000`) so traffic
+  only fails over when Anthropic is actually slow or down.
 
-The same config, generated with your provider slug and model IDs, plus the forced variant and a service key:
+The same config, generated with your provider slug and model IDs, plus a service key:
 
 ```bash
 # Fallback config. $1 = the Anthropic target's request_timeout in ms.
@@ -111,11 +117,9 @@ fallback_config() {
          {name: "fb-sonnet", provider: $p, override_params: {model: $s}},
          {name: "fb-haiku",  provider: $p, override_params: {model: $h}}]}]}'
 }
-mkcfg() { airs-cli --quiet aigateway configs create --workspace "$WS_ID" --name "$1" --set "config=$2" --output json; }
-
-CFG=$(mkcfg passthrough-fallback "$(fallback_config 120000)")          # production-like
-FORCED=$(mkcfg passthrough-fallback-forced "$(fallback_config 1)")     # Anthropic always times out -> fallback
-CFG_SLUG=$(jq -r .slug <<<"$CFG"); FORCED_SLUG=$(jq -r .slug <<<"$FORCED")
+CFG=$(airs-cli --quiet aigateway configs create --workspace "$WS_ID" --name passthrough-fallback \
+  --set "config=$(fallback_config 250)" --output json)                # demo; use e.g. 120000 for real traffic
+CFG_ID=$(jq -r .id <<<"$CFG"); CFG_SLUG=$(jq -r .slug <<<"$CFG")
 
 # Service key. No default config: the client picks one with x-portkey-config. The secret goes to gateway-key.json (gitignored).
 (umask 077; airs-cli --quiet aigateway api-keys service create --type workspace --workspace "$WS_ID" \
@@ -140,10 +144,12 @@ ask() {  # ask <config-slug> <anthropic-token> [model]  ->  status, which target
   printf '%s  %s\n' "$(grep -i '^x-portkey-last-used-option-index' /tmp/h | tr -d '\r' | cut -d' ' -f2)" \
     "$(jq -rc '.model // .error.message' /tmp/b)"
 }
-ask "$CFG_SLUG"    "$CLAUDE_CODE_OAUTH_TOKEN"   # HTTP 200  config.targets[0]            claude-haiku-4-5-…   (Anthropic)
-ask "$CFG_SLUG"    sk-ant-oat01-bogus           # HTTP 401  config.targets[0]            anthropic error: OAuth access token is invalid.
-ask "$FORCED_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN"   # HTTP 200  config.targets[1].targets[2] claude-haiku-4-5-…   (fallback)
+ask "$CFG_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN"   # HTTP 200  config.targets[1].targets[2]  claude-haiku-4-5…  (fallback)
+ask "$CFG_SLUG" sk-ant-oat01-bogus           # HTTP 401  config.targets[0]  anthropic error: OAuth access token is invalid.
 ```
+
+`ask` doesn't stream, so a good request always takes longer than 250 ms and fails over. Claude Code streams; the next
+section shows it fails over too.
 
 Use Haiku for curl checks. With a subscription token, Anthropic answered curl's Opus/Sonnet requests with `429
 rate_limit_error` while the same token and models worked from Claude Code, and a 429 triggers the fallback. Test real
@@ -173,30 +179,27 @@ served_by() {  # served_by <trace-id>  ->  provider:status per upstream call (lo
     jq -r '[.data.records | sort_by(.created_at)[] | "\(.ai_org):\(.response_status_code)"] | join("  ")'
 }
 
-cc_run "$CFG_SLUG"    "$CLAUDE_CODE_OAUTH_TOKEN"          # S1
-cc_run "$CFG_SLUG"    sk-ant-oat01-bogus                  # S2
-cc_run "$FORCED_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN"          # S3
-cc_run "$FORCED_SLUG" sk-ant-oat01-bogus                  # S4
-cc_run "$FORCED_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN" claude-opus-5-5   # S6
+cc_run "$CFG_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN"                   # S1
+cc_run "$CFG_SLUG" sk-ant-oat01-bogus                           # S2
+cc_run "$CFG_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN" claude-opus-5-5   # S3
 served_by <trace-id>
 ```
 
-Results (Claude Code 2.1.281, hybrid gateway, Vertex fallback, 2026-09-30):
+Results (Claude Code 2.1.281, hybrid gateway, Vertex fallback, `request_timeout: 250`, 2026-09-30):
 
-| # | Token | Config | Claude Code | `served_by` |
+| # | Token | Model | Claude Code | `served_by` |
 |---|---|---|---|---|
-| S1 | good | normal, Sonnet 5 | `PELICAN` | `anthropic:200` ×2 |
-| S2 | bad | normal, Sonnet 5 | `Failed to authenticate. API Error: 401` | `anthropic:401` ×2 (Claude Code retries once); no fallback |
-| S3 | good | forced, Sonnet 5 | `PELICAN` | `anthropic:408 vertex-ai:200` per turn |
-| S4 | bad | forced, Sonnet 5 | `PELICAN` | `anthropic:408 vertex-ai:200` per turn (see below) |
-| S5 | good | normal, Opus 5.5 | `PELICAN` | `anthropic:200` ×2 |
-| S6 | good | forced, Opus 5.5 | `PELICAN` | `anthropic:408 vertex-ai:400`, then `anthropic:408 vertex-ai:200` per turn |
+| S1 | good | Sonnet 5 | `PELICAN` | `anthropic:408 vertex-ai:200` per turn |
+| S2 | bad | Sonnet 5 | `Failed to authenticate. API Error: 401` | `anthropic:401` ×2 (Claude Code retries once); no fallback |
+| S3 | good | Opus 5.5 | `PELICAN` | `anthropic:408 vertex-ai:400`, then `anthropic:408 vertex-ai:200` per turn |
 
-Streaming and tool use work through the fallback, and each tier lands on the matching fallback model.
+Streaming and tool use work through the fallback, each tier lands on the matching fallback model, and a bad token never
+reaches it.
 
 ### Rolling it out
 
-Put the gateway in Claude Code's settings (or managed settings pushed by MDM). Users keep logging in with SSO:
+First recreate the config with a production timeout (`fallback_config 120000`). Then put the gateway in Claude Code's
+settings (or managed settings pushed by MDM). Users keep logging in with SSO:
 
 ```json
 {
@@ -215,29 +218,40 @@ until Claude Code can refresh custom headers, and `apiKeyHelper` switches Claude
 
 ```bash
 airs-cli --quiet aigateway api-keys service delete "$KEY_ID" --force
-airs-cli --quiet aigateway configs delete "$(jq -r .id <<<"$CFG")" --force
-airs-cli --quiet aigateway configs delete "$(jq -r .id <<<"$FORCED")" --force
+airs-cli --quiet aigateway configs delete "$CFG_ID" --force
 rm -f gateway-key.json /tmp/h /tmp/b
 ```
 
 ## Findings
 
-- **The `sk-ant` token is only validated when Anthropic answers (S4).** The gateway never checks it; it forwards it. If
-  Anthropic rejects it (401) the request stops there, because 401 isn't a fallback code. If Anthropic doesn't answer, or
+- **The `sk-ant` token is only validated when Anthropic answers.** The gateway never checks it; it forwards it. If
+  Anthropic rejects it (401) the request stops there, because 401 isn't a fallback code (S2). If Anthropic doesn't answer, or
   answers with a fallback code (timeout, 5xx, 529, 429), the fallback provider serves the request with the gateway's
-  credentials whatever the token is. In S4 the 1 ms timeout aborted the Anthropic call before it could reject the token. In
-  production the same thing happens during an Anthropic outage. **The gateway key is the credential that governs fallback
-  traffic**: use per-user keys, budgets or rate limits on the fallback provider, and alert on fallback volume.
-- **Choosing the config by header is flexible, and it's also a bypass.** Any key holder can name any config in the workspace,
-  including one that goes straight to the fallback provider with no `sk-ant` token at all. If that matters, bind the config to
-  the key and verify that the header can't override it, or keep direct-provider configs out of the workspace.
-- **Timeouts and the "auth window".** Through a hybrid gateway, a bad token's 401 came back in 0.26–0.52 s, and a good
-  streaming request's first byte in 0.73–1.78 s. A forced config with `request_timeout: 600` gave `anthropic:401` for bad
-  tokens every time (the fallback was never called) but failed over good requests only some of the time, because
-  `request_timeout` appears to cover time to first byte and Sonnet's sometimes arrives sooner. It's a good way to show that bad tokens never reach the fallback,
-  but not a dependable way to force failover, and far too tight for production. Use a generous production timeout (120 s here)
-  so long Claude Code turns don't fail over while Anthropic is healthy.
-- **One extra round trip on Opus after failover (S6).** On the first request of a session Claude Code sends a beta field
+  credentials whatever the token is. With `request_timeout: 1` every bad-token request was served by the fallback, and at
+  150 ms 2 of 20 were. In production the same thing happens during an Anthropic outage. **The gateway key is the credential
+  that governs fallback traffic**: use per-user keys, budgets or rate limits on the fallback provider, and alert on fallback
+  volume.
+- **The "auth window".** Sweeping `request_timeout` on the test gateway (a hybrid gateway on EKS in us-west-2), with
+  streamed Haiku requests:
+
+  | `request_timeout` | bad token | good token |
+  |---|---|---|
+  | 100 ms | 20/20 fallback | 12/12 fallback |
+  | 150 ms | 18/20 → 401, 2/20 fallback | 12/12 fallback |
+  | 200–350 ms | all → 401 | all fallback |
+  | 400 ms | all → 401 | 6/8 fallback |
+  | 450 ms | all → 401 | 2/8 fallback |
+
+  `request_timeout` appears to stop when Anthropic's response headers arrive, which for a streamed response is earlier than
+  the first token. Non-streamed requests wait for the whole answer, so they fail over at any of these values. Measure the
+  window from your own gateway before relying on it; it moves with network distance to Anthropic.
+- **Config edits take a while to reach a hybrid gateway.** After `airs-cli aigateway configs update`, requests kept using the
+  old timeout for a while. When tuning, create a new config per value instead of editing one in place.
+- **Choosing the config by header is flexible, and it's also a bypass.** Any key holder can name any saved config in the
+  workspace, including one that goes straight to the fallback provider with no `sk-ant` token at all. (Inline JSON configs in
+  `x-portkey-config` were rejected here with `inline_config_blocked`.) If that matters, bind the config to the key and verify
+  that the header can't override it, or keep direct-provider configs out of the workspace.
+- **One extra round trip on Opus after failover (S3).** On the first request of a session Claude Code sends a beta field
   (`output_config`, "per-turn control") that Vertex rejects: `400 messages.1.output_config: Extra inputs are not permitted`.
   Claude Code resends without it and disables that beta until `/clear` or `/compact`. Sonnet didn't hit this. The fallback
   targets don't forward `anthropic-beta`.
