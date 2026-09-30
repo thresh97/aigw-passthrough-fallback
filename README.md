@@ -53,6 +53,49 @@ The model IDs above are the Vertex ones used in testing. Check yours by calling 
 
 ## 1. Build (airs-cli)
 
+The routing config (the production-like one; the forced test config differs only in `request_timeout: 1`):
+
+```json
+{
+  "strategy": {
+    "mode": "fallback",
+    "on_status_codes": [408, 429, 500, 502, 503, 504, 529]
+  },
+  "targets": [
+    {
+      "provider": "anthropic",
+      "forward_headers": ["authorization", "anthropic-beta"],
+      "request_timeout": 120000
+    },
+    {
+      "strategy": {
+        "mode": "conditional",
+        "default": "fb-sonnet",
+        "conditions": [
+          { "query": { "params.model": { "$regex": "opus" } },  "then": "fb-opus" },
+          { "query": { "params.model": { "$regex": "haiku" } }, "then": "fb-haiku" }
+        ]
+      },
+      "targets": [
+        { "name": "fb-opus",   "provider": "@<provider-slug>", "override_params": { "model": "anthropic.claude-opus-5-5" } },
+        { "name": "fb-sonnet", "provider": "@<provider-slug>", "override_params": { "model": "anthropic.claude-sonnet-5" } },
+        { "name": "fb-haiku",  "provider": "@<provider-slug>", "override_params": { "model": "anthropic.claude-haiku-4-5" } }
+      ]
+    }
+  ]
+}
+```
+
+- `on_status_codes` decides what fails over: timeouts (408), rate limits (429) and server errors (5xx, 529). There's no 401 or
+  403, so a bad or missing `sk-ant` token gets Anthropic's error instead of the fallback.
+- The Anthropic target has no `api_key`. `forward_headers` passes the client's own `Authorization` (the OAuth token) and
+  `anthropic-beta` (Claude Code's beta flags, including `oauth-2025-04-20`) straight through.
+- The fallback is a nested conditional router on the requested model name, so each Claude Code tier keeps its tier.
+  `override_params.model` swaps in the fallback provider's model ID. The fallback targets forward no client headers; they use
+  the provider's own credentials.
+
+The same config, generated with your provider slug and model IDs, plus the forced variant and a service key:
+
 ```bash
 # Fallback config. $1 = the Anthropic target's request_timeout in ms.
 fallback_config() {
