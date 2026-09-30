@@ -121,10 +121,11 @@ CFG=$(airs-cli --quiet aigateway configs create --workspace "$WS_ID" --name pass
   --set "config=$(fallback_config 250)" --output json)                # demo; use e.g. 120000 for real traffic
 CFG_ID=$(jq -r .id <<<"$CFG"); CFG_SLUG=$(jq -r .slug <<<"$CFG")
 
-# Service key. No default config: the client picks one with x-portkey-config. The secret goes to gateway-key.json (gitignored).
+# Service key. No default config: the client picks one with x-portkey-config. Default metadata tags every request in the
+# logs (see "Metadata in the logs"). The secret goes to gateway-key.json (gitignored).
 (umask 077; airs-cli --quiet aigateway api-keys service create --type workspace --workspace "$WS_ID" \
   --organisation-id "$TSG" --name passthrough-fallback-key --scopes completions.write,logs.write \
-  --secret-output gateway-key.json --output json >/dev/null)
+  --set 'defaults={"metadata":{"app":"claude-code"}}' --secret-output gateway-key.json --output json >/dev/null)
 KEY_ID=$(jq -r .id gateway-key.json)
 ```
 
@@ -163,8 +164,8 @@ small tool-use task.
 ```bash
 cc_run() {  # cc_run <config-slug> <anthropic-token> [main-model]  ->  prints the trace id and Claude Code's result
   local wd cfgdir trace headers; wd=$(mktemp -d); cfgdir=$(mktemp -d); trace="pf-test-$(date +%s)-$RANDOM"
-  headers=$(printf 'x-portkey-api-key: %s\nx-portkey-config: %s\nx-portkey-trace-id: %s' \
-    "$(jq -r .key gateway-key.json)" "$1" "$trace")
+  headers=$(printf 'x-portkey-api-key: %s\nx-portkey-config: %s\nx-portkey-trace-id: %s\nx-portkey-metadata: %s' \
+    "$(jq -r .key gateway-key.json)" "$1" "$trace" '{"_user":"test.user@example.com"}')
   echo "the secret word is PELICAN" > "$wd/hello.txt"
   (cd "$wd" && env -i PATH="$PATH" HOME="$HOME" CLAUDE_CONFIG_DIR="$cfgdir" CLAUDE_CODE_OAUTH_TOKEN="$2" \
     ANTHROPIC_BASE_URL="$GATEWAY" ANTHROPIC_CUSTOM_HEADERS="$headers" \
@@ -174,9 +175,10 @@ cc_run() {  # cc_run <config-slug> <anthropic-token> [main-model]  ->  prints th
       --allowedTools Read --output-format json </dev/null 2>/dev/null) | jq -r --arg t "$trace" '"\($t)  is_error=\(.is_error)  \(.result)"'
   rm -rf "$wd" "$cfgdir"
 }
-served_by() {  # served_by <trace-id>  ->  provider:status per upstream call (logs can take ~20 s to appear)
+served_by() {  # served_by <trace-id>  ->  provider:status per upstream call, then the logged metadata (logs take ~20 s)
   airs-cli --quiet aigateway telemetry logs list --workspace "$WS" --trace-id "$1" --output json |
-    jq -r '[.data.records | sort_by(.created_at)[] | "\(.ai_org):\(.response_status_code)"] | join("  ")'
+    jq -r '.data.records | sort_by(.created_at) | (map("\(.ai_org):\(.response_status_code)") | join("  ")) + "   " +
+      (.[0] | [.metadataKey, .metadataValue] | transpose | map("\(.[0])=\(.[1])") | join(" "))'
 }
 
 cc_run "$CFG_SLUG" "$CLAUDE_CODE_OAUTH_TOKEN"                   # S1
@@ -213,6 +215,31 @@ settings (or managed settings pushed by MDM). Users keep logging in with SSO:
 `ANTHROPIC_CUSTOM_HEADERS` is static (read at launch), so the gateway credential has to be a long-lived key; per-user keys
 (`airs-cli aigateway api-keys user create`) give per-user logs, budgets and revocation. Short-lived IdP JWTs aren't practical
 until Claude Code can refresh custom headers, and `apiKeyHelper` switches Claude Code off subscription auth.
+
+### Metadata in the logs
+
+Every gateway log record has a `_user` field and `metadataKey` / `metadataValue` lists, which log views (such as Strata Cloud
+Manager) can show and filter on. Both upstream calls of a failed-over request (the Anthropic 408 and the fallback's 200) get
+the same metadata. There are two ways to set it:
+
+- **Key defaults** (`defaults.metadata` on the key, as in step 1). Set once, and applied to every request made with the key.
+- **The `x-portkey-metadata` header**: a JSON object; `_user` is the reserved key for the user. Claude Code sends it like any
+  other custom header:
+
+  ```json
+  "ANTHROPIC_CUSTOM_HEADERS": "x-portkey-api-key: <gateway key>\nx-portkey-config: <config-slug>\nx-portkey-metadata: {\"_user\":\"alice@example.com\",\"team\":\"platform\"}"
+  ```
+
+The two are merged, and **the key's value wins** when both set the same field. In testing, a key with
+`{"_user":"key.user@example.com","app":"claude-code"}` and a request header `{"_user":"spoofed@example.com"}` logged
+`_user=key.user@example.com`. So:
+
+- Put fields the client mustn't choose (`app`, `team`, cost center) in the key's defaults. Header metadata is self-reported.
+- For a trustworthy `_user`, give each user their own key with `_user` in its defaults
+  (`airs-cli aigateway api-keys service update <key-id> --set 'defaults={"metadata":{...}}'`; changes applied within ~30 s).
+  With one shared key, `_user` from the header is only as good as whatever writes each user's settings.
+- `ANTHROPIC_CUSTOM_HEADERS` is a literal string with no variable expansion, so a per-user header value has to be written into
+  each user's settings (e.g. by the MDM script that deploys them).
 
 ## 4. Teardown
 
